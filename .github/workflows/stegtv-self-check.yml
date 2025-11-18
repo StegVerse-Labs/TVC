@@ -1,0 +1,43 @@
+name: StegTVC Self-Check
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  self_check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout StegTVC
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run StegTVC config + resolver self-check
+        run: |
+          python - << 'PY'
+          import json
+          from app.config import load_stegtv_config
+          from app.resolver import stegtvc_resolve
+
+          print("=== StegTVC Self-Check ===")
+
+          cfg = load_stegtv_config()
+          print("\n--- Loaded config ---")
+          print(json.dumps(cfg, indent=2))
+
+          print("\n--- Test resolve (connectivity-check) ---")
+          result = stegtvc_resolve(
+              use_case="connectivity-check",
+              module="self-test",
+              importance="normal",
+          )
+          print(json.dumps(result, indent=2))
+
+          print("\n✅ StegTVC self-check completed.")
+          PY
