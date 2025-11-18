@@ -1,54 +1,63 @@
-"""
-app.models
-
-Shared Pydantic models for StegTVC core.
-"""
-
 from __future__ import annotations
 
-from typing import Optional, Literal
+from typing import Any, Dict, Optional
+
 from pydantic import BaseModel, Field
 
 
-class HealthStatus(BaseModel):
-    status: Literal["ok", "degraded", "error"]
-    message: str
-    bundle_version: Optional[int] = None
+class ProviderInfo(BaseModel):
+    """Concrete provider/model details other repos can act on."""
 
-
-class TokenIssueRequest(BaseModel):
-    subject: str = Field(..., description="Entity ID (human or AI)")
-    role: str = Field(..., description="Role name (e.g., guardian_ai, stegcore)")
-    ttl_seconds: int = Field(3600, description="Token lifetime in seconds")
-    audience: str = Field("stegverse", description="Intended audience")
-
-
-class TokenIssueResponse(BaseModel):
-    token: str
-    expires_in: int
-    role: str
-    subject: str
-
-
-class AIRequest(BaseModel):
-    provider: Literal["github_models"] = Field(
-        "github_models", description="Initial provider; more later"
+    name: str = Field(..., description="Provider identifier, e.g. 'github_models' or 'openai'.")
+    model: str = Field(..., description="Model identifier, e.g. 'openai/gpt-4.1-mini'.")
+    endpoint: Optional[str] = Field(
+        None,
+        description="Optional HTTP endpoint. Many callers can rely on their own defaults.",
     )
-    model: str = Field(
-        "openai/gpt-4.1",
-        description="GitHub Models model ID (e.g., openai/gpt-4.1)",
-    )
-    prompt: str
-    system_prompt: str | None = None
-    max_tokens: int = 512
-    temperature: float = 0.2
-    trace_tag: str | None = Field(
-        None, description="Optional tag for chainlog correlation"
+    notes: Optional[str] = Field(
+        None,
+        description="Human-readable notes or caveats about this provider.",
     )
 
 
-class AIResponse(BaseModel):
-    provider: str
-    model: str
-    output: str
-    trace_id: str
+class ProviderResolveRequest(BaseModel):
+    """
+    Input sent from other StegVerse components to decide which
+    provider/model/config to use.
+    """
+
+    use_case: str = Field(
+        "generic-text-review",
+        description="High-level purpose: 'generic-text-review', 'code-review', etc.",
+    )
+    repo: Optional[str] = Field(
+        None,
+        description="GitHub repo name (e.g. 'StegVerse/StegCore') for future policy routing.",
+    )
+    module: Optional[str] = Field(
+        None,
+        description="Logical module name, e.g. 'SCW', 'TV', 'StegCore', 'StegTalk'.",
+    )
+    importance: str = Field(
+        "normal",
+        description="Hint for cost/speed: 'low', 'normal', 'high', 'critical'.",
+    )
+    extra: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Free-form metadata; ignored by current v1.0 implementation.",
+    )
+
+
+class ProviderResolveResponse(BaseModel):
+    """Result returned from StegTVC to a caller."""
+
+    provider: ProviderInfo
+    use_case: str = Field(..., description="Echo of requested use_case for traceability.")
+    constraints: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional constraints like max_tokens, temperature, etc.",
+    )
+    steward: str = Field(
+        "StegTVC",
+        description="Name of the steward service that produced this decision.",
+    )
