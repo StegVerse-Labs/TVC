@@ -1,0 +1,37 @@
+{
+  "providers": [
+    {
+      "name": "GitHub-Models",
+      "model": "gpt-4.1-mini",
+      "endpoint": "https://models.github.ai/inference/chat/completions",
+      "priority": 1
+    }
+  ],
+
+  "rules": [
+    {
+      "use_case": "connectivity-check",
+      "module": "self-test",
+      "provider": "GitHub-Models",
+      "note": "Used by StegTVC self_check workflow"
+    },
+    {
+      "use_case": "connectivity-check",
+      "module": "hybrid-collab-bridge",
+      "provider": "GitHub-Models",
+      "note": "Used by Hybrid-Collab-Bridge connectivity diagnostics"
+    },
+    {
+      "use_case": "connectivity-check",
+      "module": "*",
+      "provider": "GitHub-Models",
+      "note": "Fallback for any connectivity-check request"
+    },
+    {
+      "use_case": "*",
+      "module": "*",
+      "provider": "GitHub-Models",
+      "note": "Global default fallback"
+    }
+  ]
+}
