@@ -1,0 +1,38 @@
+name: StegTVC Core CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint import & import main
+        env:
+          STEGTV_POLICY_BUNDLE_PATH: "./policy_bundle.json"
+        run: |
+          python - << 'PY'
+          from pathlib import Path
+          bundle_path = Path("policy_bundle.json")
+          if not bundle_path.exists():
+              bundle_path.write_text('{"version": 0, "content": {}}', encoding="utf-8")
+
+          import app.main  # noqa: F401
+          print("Imported app.main OK")
+          PY
