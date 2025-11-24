@@ -1,0 +1,42 @@
+name: Token Write Test
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  write-test:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_STEGVERSE_AI_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create marker file
+        run: |
+          echo "verified $(date -u +%Y-%m-%dT%H:%M:%SZ)" > .stegverse-verified
+
+      - name: Commit & push to new branch
+        run: |
+          git config user.name "StegVerse-AI"
+          git config user.email "actions@github.com"
+          BRANCH="test/write-verification-$(date +%s)"
+          git checkout -b "$BRANCH"
+          git add .stegverse-verified
+          git commit -m "test: verify AI write permissions"
+          git push --set-upstream origin "$BRANCH"
+          echo "BRANCH_NAME=$BRANCH" >> $GITHUB_ENV
+
+      - name: Open PR against default branch
+        run: |
+          BASE_BRANCH="${{ github.event.repository.default_branch }}"
+          gh pr create \
+            --title "Token Write Verification" \
+            --body "This PR verifies write permissions via GH_STEGVERSE_AI_TOKEN." \
+            --head "$BRANCH_NAME" \
+            --base "$BASE_BRANCH"
