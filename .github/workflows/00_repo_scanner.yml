@@ -1,0 +1,106 @@
+name: 00 - Repo Scanner
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master"]
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Repo identity
+        run: |
+          echo "repo: $GITHUB_REPOSITORY"
+          echo "ref:  $GITHUB_REF"
+          echo "sha:  $GITHUB_SHA"
+          echo "actor:$GITHUB_ACTOR"
+          echo "event:$GITHUB_EVENT_NAME"
+          echo "----"
+          echo "pwd:  $(pwd)"
+          echo "ls:"
+          ls -la
+
+      - name: Tree (depth 4, skip heavy dirs)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y tree ripgrep
+          echo "---- TREE (depth 4) ----"
+          tree -a -L 4 \
+            -I ".git|node_modules|.venv|venv|__pycache__|dist|build|coverage|.next|.cache|.pytest_cache|.mypy_cache|.ruff_cache|.idea|.vscode" \
+            .
+
+      - name: Workflows summary
+        run: |
+          echo "---- WORKFLOWS ----"
+          if [ -d ".github/workflows" ]; then
+            ls -la .github/workflows
+            echo
+            for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+              [ -f "$f" ] || continue
+              echo "== $f =="
+              # show only the trigger section (first ~80 lines is usually enough)
+              sed -n '1,120p' "$f"
+              echo
+            done
+          else
+            echo "No .github/workflows directory."
+          fi
+
+      - name: Look for canonical folders (schemas, prompts, events, ledger)
+        run: |
+          echo "---- CANONICAL FOLDERS ----"
+          for d in schemas schema prompts prompt agents agent stegagents events event ledger ledgers logs log governance orchestrator ops; do
+            if find . -maxdepth 4 -type d -iname "$d" | head -n 5 | grep -q .; then
+              echo "Found dir name match: $d"
+              find . -maxdepth 4 -type d -iname "$d" | head -n 20
+              echo
+            fi
+          done
+
+      - name: Keyword scan (fast, high-signal)
+        run: |
+          echo "---- KEYWORD SCAN (top hits) ----"
+          rg -n --hidden --no-follow \
+            -S \
+            "(workflow_dispatch|repository_dispatch|issue_comment|pull_request_target|orchestrator|dispatcher|runner|work[_-]?item|verdict|quorum|constitution|invariant|policy|token[_-]?vault|tvc|stegid|agent|router|builder|verifier|audit|append[- ]only|hash chain|chain[- ]of[- ]custody)" \
+            . \
+            -g'!.git/**' \
+            -g'!node_modules/**' \
+            -g'!.venv/**' \
+            -g'!venv/**' \
+            -g'!dist/**' \
+            -g'!build/**' \
+            -g'!coverage/**' \
+            | head -n 300 || true
+
+      - name: Files likely relevant (names)
+        run: |
+          echo "---- LIKELY-RELEVANT FILENAMES ----"
+          find . -maxdepth 5 -type f \( \
+            -iname "*orchestrator*" -o \
+            -iname "*runner*" -o \
+            -iname "*dispatcher*" -o \
+            -iname "*work*item*" -o \
+            -iname "*ledger*" -o \
+            -iname "*event*" -o \
+            -iname "*schema*" -o \
+            -iname "*verdict*" -o \
+            -iname "*governance*" -o \
+            -iname "*constitution*" -o \
+            -iname "*invariant*" -o \
+            -iname "*agent*" -o \
+            -iname "*prompt*" \
+          \) \
+          | sed 's|^\./||' \
+          | head -n 300
