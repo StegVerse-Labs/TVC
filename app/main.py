@@ -1,3 +1,4 @@
+# app/main.py
 from __future__ import annotations
 
 import os
@@ -5,8 +6,10 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from .config import get_settings, get_default_provider
@@ -70,12 +73,22 @@ def _admin_token() -> str:
 
 
 def _env() -> str:
-    # Your config.py uses ENV already; keep consistent.
+    # Keep consistent with config.py and your Render env var naming.
     return (os.getenv("ENV") or "production").strip().lower()
 
 
 def _docs_enabled() -> bool:
-    # Only enable docs in dev-like envs.
+    """
+    Default behavior: docs only in dev-like envs.
+    Override via STEGTV_DOCS_ENABLED:
+      - "1"/"true"/"yes" => force on
+      - "0"/"false"/"no" => force off
+    """
+    raw = (os.getenv("STEGTV_DOCS_ENABLED") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
     return _env() in ("dev", "development", "local")
 
 
@@ -112,10 +125,8 @@ async def _get_redis() -> Optional["redis_async.Redis"]:
     if not url:
         return None
     if redis_async is None:
-        # redis lib not installed; just act like redis is absent.
         return None
 
-    # decode_responses=True returns strings instead of bytes
     _redis = redis_async.from_url(url, decode_responses=True)
     return _redis
 
@@ -132,14 +143,12 @@ async def _get_rev_epoch() -> int:
             return 0
         return int(v)
     except Exception:
-        # If redis is flaky, fall back to process env epoch.
         return int(os.getenv("STEGTV_REV_EPOCH", "0") or 0)
 
 
 async def _bump_rev_epoch() -> int:
     r = await _get_redis()
     if r is None:
-        # Process-local fallback (not shared across instances).
         cur = int(os.getenv("STEGTV_REV_EPOCH", "0") or 0) + 1
         os.environ["STEGTV_REV_EPOCH"] = str(cur)
         return cur
@@ -154,9 +163,13 @@ async def _bump_rev_epoch() -> int:
 
 
 # ------------------------
-# Auth dependency
+# Admin Auth (Swagger Authorize support)
 # ------------------------
-async def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> None:
+# This is the key change: using APIKeyHeader + Security makes Swagger show "Authorize"
+admin_api_key = APIKeyHeader(name="X-Admin-Token", auto_error=False)
+
+
+async def require_admin(x_admin_token: Optional[str] = Security(admin_api_key)) -> None:
     expected = _admin_token()
     presented = (x_admin_token or "").strip()
     if not presented or presented != expected:
@@ -214,6 +227,56 @@ app = FastAPI(
 
 
 # ------------------------
+# OpenAPI hardening + Authorize button
+# ------------------------
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    # Ensure AdminToken scheme is present even if FastAPI changes defaults later.
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    schema["components"]["securitySchemes"]["AdminToken"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Admin-Token",
+        "description": "Admin token required for admin-protected endpoints.",
+    }
+
+    # Mark only the admin endpoints as requiring AdminToken (locks + auto header injection in Swagger).
+    for path, methods in (schema.get("paths") or {}).items():
+        for method, op in (methods or {}).items():
+            if not isinstance(op, dict):
+                continue
+            # secure only the token endpoints (your admin surface)
+            if path.startswith("/tokens/"):
+                op.setdefault("security", [{"AdminToken": []}])
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
+# ------------------------
+# Global exception hardening (never crash health/docs with raw trace)
+# ------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # In prod: avoid leaking internals. In dev: keep slightly more detail.
+    if _env() in ("dev", "development", "local"):
+        return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {type(exc).__name__}: {exc}"})
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+
+# ------------------------
 # Routes
 # ------------------------
 @app.get("/", summary="Root (avoid Render HEAD / 404 noise)")
@@ -237,12 +300,11 @@ async def health() -> Dict[str, Any]:
             except Exception:
                 redis_ok = False
 
-    payload = {
+    payload: Dict[str, Any] = {
         "status": "ok",
         "env": _env(),
         "service": "stegtvc",
         "version": settings.version,
-        "public_url": _public_url() or settings.default_provider.get("endpoint", ""),
         "default_provider": {
             "name": provider.get("name"),
             "model": provider.get("model"),
@@ -261,6 +323,12 @@ async def health() -> Dict[str, Any]:
             "ok": redis_ok,
         },
     }
+
+    # Only include public_url if explicitly set (avoid leaking internal/3rd-party endpoints)
+    pu = _public_url()
+    if pu:
+        payload["public_url"] = pu
+
     return payload
 
 
