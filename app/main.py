@@ -1,18 +1,19 @@
-# app/main.py
 from __future__ import annotations
 
-import hmac
 import os
 import time
 import uuid
+import hmac
+import secrets
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from .config import get_default_provider, get_settings
-from .models import ProviderInfo, ProviderResolveRequest, ProviderResolveResponse
+from .config import get_settings, get_default_provider
+from .models import ProviderResolveRequest, ProviderResolveResponse, ProviderInfo
 from .services import resolve_provider
 
 # --- Optional dependency: PyJWT ---
@@ -23,85 +24,73 @@ except Exception as e:  # pragma: no cover
     _jwt_import_error = e
 
 
-# ---------------------------
-# Settings access (robust)
-# ---------------------------
-def _settings_get(key: str, default: Any = None) -> Any:
-    """
-    get_settings() might return a pydantic object OR (in some states) a dict.
-    This accessor avoids AttributeError footguns.
-    """
-    s = get_settings()
-    if isinstance(s, dict):
-        return s.get(key, default)
-    return getattr(s, key, default)
+# -----------------------------
+# Environment / hardening
+# -----------------------------
+def _env() -> str:
+    # Render: add ENV=dev (temporary) to enable docs
+    # Default to "prod" to be conservative.
+    return (os.getenv("ENV", "prod") or "prod").strip().lower()
 
 
-# ---------------------------
-# Admin gate (critical hardening)
-# ---------------------------
-def _admin_token() -> str:
-    # Prefer TVC-specific token; fall back to shared ADMIN_TOKEN if you want unified ops.
-    tok = (os.getenv("STEGTV_ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") or "").strip()
-    if not tok:
-        # Fail closed in prod if not configured.
-        raise HTTPException(status_code=500, detail="Missing STEGTV_ADMIN_TOKEN (or ADMIN_TOKEN).")
-    return tok
+IS_DEV = _env() in {"dev", "development", "local", "staging", "test"}
 
 
-def require_admin(x_admin_token: str = Header(default="", alias="X-Admin-Token")) -> None:
-    expected = _admin_token()
-    provided = (x_admin_token or "").strip()
-    if not provided or not hmac.compare_digest(provided, expected):
+def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
+    # get_settings() should return an object, but we defensively support dict too.
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+# -----------------------------
+# Admin token auth (X-Admin-Token)
+# -----------------------------
+ADMIN_HEADER_NAME = "X-Admin-Token"
+_admin_header = APIKeyHeader(name=ADMIN_HEADER_NAME, auto_error=False)
+
+
+def _admin_secret() -> str:
+    # You added STEGTV_ADMIN_TOKEN in Render env vars — this is where it's used.
+    secret = (os.getenv("STEGTV_ADMIN_TOKEN", "") or "").strip()
+    if not secret:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing env var STEGTV_ADMIN_TOKEN (required for admin-protected routes).",
+        )
+    if len(secret) < 24:
+        # Not fatal, but strongly discouraged — keep it long and random.
+        # You can remove this check if you prefer.
+        raise HTTPException(
+            status_code=500,
+            detail="STEGTV_ADMIN_TOKEN is too short (recommend 24+ chars).",
+        )
+    return secret
+
+
+def _require_admin(x_admin_token: Optional[str]) -> None:
+    expected = _admin_secret()
+
+    if not x_admin_token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    provided = x_admin_token.strip()
+
+    # Constant-time comparison
+    if not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _public_resolve_enabled() -> bool:
-    return os.getenv("STEGTV_PUBLIC_RESOLVE", "").strip().lower() in {"1", "true", "yes"}
+def require_admin(
+    # This makes Swagger aware of the header and shows it in the UI flows.
+    x_admin_token: Optional[str] = Depends(_admin_header),
+) -> None:
+    _require_admin(x_admin_token)
 
 
-def require_admin_unless_public_resolve(request: Request) -> None:
-    """
-    Protect /providers/resolve by default.
-    If STEGTV_PUBLIC_RESOLVE=1, it becomes public.
-    """
-    if _public_resolve_enabled():
-        return
-    # Enforce admin if not public
-    x_admin = request.headers.get("X-Admin-Token", "")
-    expected = _admin_token()
-    if not x_admin or not hmac.compare_digest(x_admin.strip(), expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-# ---------------------------
-# Lightweight in-memory rate limiting
-# ---------------------------
-_RATE_BUCKET: Dict[str, tuple[int, int]] = {}  # ip -> (window_start_epoch, count)
-
-
-def rate_limit(max_per_minute: int = 60):
-    def _dep(request: Request) -> None:
-        # Best-effort IP detection. (Behind proxies, you may want X-Forwarded-For parsing later.)
-        ip = request.client.host if request.client else "unknown"
-        now = int(time.time())
-        window = now - (now % 60)
-
-        ws, cnt = _RATE_BUCKET.get(ip, (window, 0))
-        if ws != window:
-            ws, cnt = window, 0
-
-        cnt += 1
-        _RATE_BUCKET[ip] = (ws, cnt)
-
-        if cnt > max_per_minute:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
-    return _dep
-
-
-# ---------------------------
+# -----------------------------
 # JWT helpers
-# ---------------------------
+# -----------------------------
 def _require_jwt() -> None:
     if jwt is None:
         raise HTTPException(
@@ -114,21 +103,18 @@ def _require_jwt() -> None:
 
 
 def _jwt_secret() -> str:
-    secret = os.getenv("STEGTV_JWT_SECRET", "").strip()
+    secret = (os.getenv("STEGTV_JWT_SECRET", "") or "").strip()
     if not secret:
-        raise HTTPException(status_code=500, detail="Missing env var STEGTV_JWT_SECRET (required for /tokens/*).")
-    if len(secret) < 16:
-        raise HTTPException(status_code=500, detail="STEGTV_JWT_SECRET is too short (min 16 chars recommended).")
+        raise HTTPException(
+            status_code=500,
+            detail="Missing env var STEGTV_JWT_SECRET (required for /tokens/*).",
+        )
+    if len(secret) < 32:
+        raise HTTPException(
+            status_code=500,
+            detail="STEGTV_JWT_SECRET is too short (recommend 32+ chars).",
+        )
     return secret
-
-
-def _jwt_issuer() -> str:
-    return "stegverse:tvc"
-
-
-def _jwt_audience() -> str:
-    # You can change this later (e.g. "stegverse:scw") but keep it stable across consumers.
-    return os.getenv("STEGTV_JWT_AUD", "stegverse:scw").strip() or "stegverse:scw"
 
 
 # In-memory revocation epoch (v0.1). Bump it to invalidate all existing tokens.
@@ -147,20 +133,18 @@ def _clamp_ttl(ttl_seconds: int) -> int:
     return max(10, min(ttl_seconds, 300))
 
 
-# ---------------------------
-# Token models
-# ---------------------------
+# ---------- Token models ----------
 class TokenIssueRequest(BaseModel):
     sub: str = Field(..., description="Subject identifier (user/workload).")
     action: str = Field(..., description="Machine-readable action name, e.g. 'deploy', 'write_repo'.")
     scope: str = Field(..., description="Resource scope, e.g. 'repo:StegVerse-Labs/TVC'.")
     ttl_seconds: int = Field(120, description="Token TTL seconds (clamped 10..300).")
 
-    ctx_hash: Optional[str] = Field(None, description="Optional context hash (bind token to request payload/env).")
-    bundle_hash: Optional[str] = Field(None, description="Optional policy bundle hash/digest (bind token to policy version).")
+    ctx_hash: Optional[str] = Field(None, description="Optional context hash binding (recommended).")
+    bundle_hash: Optional[str] = Field(None, description="Optional policy bundle hash/digest binding (recommended).")
 
     mode: str = Field("assisted", description="manual|assisted|autonomous|degraded|frozen")
-    extra: Optional[Dict[str, Any]] = Field(None, description="Optional extra claims dict (namespaced under x).")
+    extra: Optional[Dict[str, Any]] = Field(None, description="Optional extra claims dict (discouraged).")
 
 
 class TokenIssueResponse(BaseModel):
@@ -184,42 +168,49 @@ class TokenRevokeResponse(BaseModel):
     rev: int
 
 
-# ---------------------------
-# App init (optionally disable docs in prod)
-# ---------------------------
-ENV = (os.getenv("ENV") or os.getenv("STEGTV_ENV") or "prod").strip().lower()
-_disable_docs = ENV in {"prod", "production"}
+# -----------------------------
+# FastAPI app with prod docs toggle
+# -----------------------------
+_settings = get_settings()
 
 app = FastAPI(
     title="StegTVC Core",
     description="StegVerse Token Vault Config / AI Provider Router (Core v1.0, option C).",
-    version=str(_settings_get("version", "0.1.0")),
-    docs_url=None if _disable_docs else "/docs",
-    redoc_url=None if _disable_docs else "/redoc",
-    openapi_url=None if _disable_docs else "/openapi.json",
+    version=str(_safe_getattr(_settings, "version", "0.1.0")),
+    docs_url="/docs" if IS_DEV else None,
+    redoc_url="/redoc" if IS_DEV else None,
+    openapi_url="/openapi.json" if IS_DEV else None,
 )
 
+# Expose an "Authorize" flow in Swagger for X-Admin-Token
+# (Swagger UI will show a global auth control).
+app.openapi_tags = [{"name": "admin", "description": "Admin-protected endpoints"}]
+app.swagger_ui_init_oauth = {}  # harmless; keeps UI config explicit
+app.openapi_schema = None  # let FastAPI build on demand
 
-# ---------------------------
-# Routes
-# ---------------------------
+
 @app.get("/health", summary="Basic health check")
 async def health() -> JSONResponse:
+    settings = get_settings()
     provider = get_default_provider()
+
     payload = {
         "status": "ok",
-        "service": str(_settings_get("service_name", "stegtvc")),
-        "version": str(_settings_get("version", "0.1.0")),
-        "public_url": str(_settings_get("public_url", "")),
-        # Intentionally omit provider endpoint in health to reduce intel leakage
+        "env": _env(),
+        "service": _safe_getattr(settings, "service_name", "tvc"),
+        "version": _safe_getattr(settings, "version", "0.1.0"),
+        "public_url": _safe_getattr(settings, "public_url", None),
         "default_provider": {
-            "name": getattr(provider, "name", None),
-            "model": getattr(provider, "model", None),
+            "name": provider.name,
+            "model": provider.model,
+            "endpoint": provider.endpoint,
         },
-        "ephemeral_security": {
+        "security": {
+            "admin_header": ADMIN_HEADER_NAME,
+            "docs_enabled": bool(IS_DEV),
             "token_ttl_max_seconds": 300,
             "revocation_epoch": _REV_EPOCH,
-            # Intentionally omit algorithm/secret details from health
+            "jwt_signing": "HS256 (env: STEGTV_JWT_SECRET)",
         },
     }
     return JSONResponse(payload)
@@ -229,7 +220,6 @@ async def health() -> JSONResponse:
     "/providers/resolve",
     response_model=ProviderResolveResponse,
     summary="Resolve which provider/model/config to use for a given use-case.",
-    dependencies=[Depends(require_admin_unless_public_resolve), Depends(rate_limit(120))],
 )
 async def providers_resolve(body: ProviderResolveRequest) -> ProviderResolveResponse:
     return resolve_provider(body)
@@ -239,7 +229,6 @@ async def providers_resolve(body: ProviderResolveRequest) -> ProviderResolveResp
     "/providers/default",
     response_model=ProviderInfo,
     summary="Return the currently configured default provider/model.",
-    dependencies=[Depends(require_admin), Depends(rate_limit(120))],
 )
 async def providers_default() -> ProviderInfo:
     base = get_default_provider()
@@ -247,18 +236,21 @@ async def providers_default() -> ProviderInfo:
         name=base.name,
         model=base.model,
         endpoint=base.endpoint,
-        notes=getattr(base, "notes", None),
+        notes=base.notes,
     )
 
 
-# ---------- Ephemeral tokens (ADMIN-GATED) ----------
+# ---------- Ephemeral tokens (admin-protected) ----------
 @app.post(
     "/tokens/issue",
     response_model=TokenIssueResponse,
     summary="Issue an ephemeral, action-scoped StegVerse token.",
-    dependencies=[Depends(require_admin), Depends(rate_limit(30))],
+    tags=["admin"],
 )
-async def tokens_issue(body: TokenIssueRequest) -> TokenIssueResponse:
+async def tokens_issue(
+    body: TokenIssueRequest,
+    _admin: None = Depends(require_admin),
+) -> TokenIssueResponse:
     _require_jwt()
     secret = _jwt_secret()
 
@@ -268,8 +260,7 @@ async def tokens_issue(body: TokenIssueRequest) -> TokenIssueResponse:
     jti = str(uuid.uuid4())
 
     claims: Dict[str, Any] = {
-        "iss": _jwt_issuer(),
-        "aud": _jwt_audience(),
+        "iss": "stegverse:tvc",
         "sub": body.sub,
         "iat": iat,
         "exp": exp,
@@ -295,22 +286,17 @@ async def tokens_issue(body: TokenIssueRequest) -> TokenIssueResponse:
     "/tokens/verify",
     response_model=TokenVerifyResponse,
     summary="Verify a StegVerse token and return claims.",
-    dependencies=[Depends(require_admin), Depends(rate_limit(60))],
+    tags=["admin"],
 )
-async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
+async def tokens_verify(
+    body: TokenVerifyRequest,
+    _admin: None = Depends(require_admin),
+) -> TokenVerifyResponse:
     _require_jwt()
     secret = _jwt_secret()
 
     try:
-        claims = jwt.decode(
-            body.token,
-            secret,
-            algorithms=["HS256"],
-            audience=_jwt_audience(),
-            issuer=_jwt_issuer(),
-            options={"require": ["exp", "iat", "iss", "aud", "jti"]},
-            leeway=10,  # small clock skew tolerance
-        )
+        claims = jwt.decode(body.token, secret, algorithms=["HS256"])
     except Exception as e:
         return TokenVerifyResponse(valid=False, claims=None, reason=f"decode_failed: {e}")
 
@@ -329,9 +315,11 @@ async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
     "/tokens/revoke",
     response_model=TokenRevokeResponse,
     summary="Revoke all previously issued tokens (bump epoch).",
-    dependencies=[Depends(require_admin), Depends(rate_limit(10))],
+    tags=["admin"],
 )
-async def tokens_revoke() -> TokenRevokeResponse:
+async def tokens_revoke(
+    _admin: None = Depends(require_admin),
+) -> TokenRevokeResponse:
     global _REV_EPOCH
     _REV_EPOCH += 1
     return TokenRevokeResponse(rev=_REV_EPOCH)
