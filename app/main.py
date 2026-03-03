@@ -6,10 +6,7 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
-from fastapi.openapi.utils import get_openapi
-from fastapi.responses import JSONResponse
-from fastapi.security.api_key import APIKeyHeader
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .config import get_settings, get_default_provider
@@ -73,22 +70,12 @@ def _admin_token() -> str:
 
 
 def _env() -> str:
-    # Keep consistent with config.py and your Render env var naming.
+    # Use ENV as you confirmed in Render.
     return (os.getenv("ENV") or "production").strip().lower()
 
 
 def _docs_enabled() -> bool:
-    """
-    Default behavior: docs only in dev-like envs.
-    Override via STEGTV_DOCS_ENABLED:
-      - "1"/"true"/"yes" => force on
-      - "0"/"false"/"no" => force off
-    """
-    raw = (os.getenv("STEGTV_DOCS_ENABLED") or "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
+    # Enable docs only in dev-like envs.
     return _env() in ("dev", "development", "local")
 
 
@@ -110,6 +97,43 @@ def _verify_grace_seconds() -> int:
     return max(0, min(v, 300))
 
 
+def _provider_dict(p: Any) -> Dict[str, Any]:
+    """
+    Normalize provider into a dict safely.
+    Supports:
+      - dict
+      - Pydantic v2 model (model_dump)
+      - dataclass / object with attributes (vars/getattr)
+    """
+    if p is None:
+        return {}
+    if isinstance(p, dict):
+        return p
+    # Pydantic v2
+    md = getattr(p, "model_dump", None)
+    if callable(md):
+        try:
+            d = md()
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+    # dataclass / plain object
+    try:
+        d2 = vars(p)
+        if isinstance(d2, dict):
+            return d2
+    except Exception:
+        pass
+    # best-effort attribute pull
+    out: Dict[str, Any] = {}
+    for k in ("name", "model", "endpoint", "priority", "notes"):
+        v = getattr(p, k, None)
+        if v is not None:
+            out[k] = v
+    return out
+
+
 # ------------------------
 # Redis wiring (optional)
 # ------------------------
@@ -127,6 +151,7 @@ async def _get_redis() -> Optional["redis_async.Redis"]:
     if redis_async is None:
         return None
 
+    # decode_responses=True returns strings instead of bytes
     _redis = redis_async.from_url(url, decode_responses=True)
     return _redis
 
@@ -163,13 +188,9 @@ async def _bump_rev_epoch() -> int:
 
 
 # ------------------------
-# Admin Auth (Swagger Authorize support)
+# Auth dependency
 # ------------------------
-# This is the key change: using APIKeyHeader + Security makes Swagger show "Authorize"
-admin_api_key = APIKeyHeader(name="X-Admin-Token", auto_error=False)
-
-
-async def require_admin(x_admin_token: Optional[str] = Security(admin_api_key)) -> None:
+async def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> None:
     expected = _admin_token()
     presented = (x_admin_token or "").strip()
     if not presented or presented != expected:
@@ -227,56 +248,6 @@ app = FastAPI(
 
 
 # ------------------------
-# OpenAPI hardening + Authorize button
-# ------------------------
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-
-    schema = get_openapi(
-        title=app.title,
-        version=app.version,
-        description=app.description,
-        routes=app.routes,
-    )
-
-    # Ensure AdminToken scheme is present even if FastAPI changes defaults later.
-    schema.setdefault("components", {}).setdefault("securitySchemes", {})
-    schema["components"]["securitySchemes"]["AdminToken"] = {
-        "type": "apiKey",
-        "in": "header",
-        "name": "X-Admin-Token",
-        "description": "Admin token required for admin-protected endpoints.",
-    }
-
-    # Mark only the admin endpoints as requiring AdminToken (locks + auto header injection in Swagger).
-    for path, methods in (schema.get("paths") or {}).items():
-        for method, op in (methods or {}).items():
-            if not isinstance(op, dict):
-                continue
-            # secure only the token endpoints (your admin surface)
-            if path.startswith("/tokens/"):
-                op.setdefault("security", [{"AdminToken": []}])
-
-    app.openapi_schema = schema
-    return app.openapi_schema
-
-
-app.openapi = custom_openapi
-
-
-# ------------------------
-# Global exception hardening (never crash health/docs with raw trace)
-# ------------------------
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    # In prod: avoid leaking internals. In dev: keep slightly more detail.
-    if _env() in ("dev", "development", "local"):
-        return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {type(exc).__name__}: {exc}"})
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-
-
-# ------------------------
 # Routes
 # ------------------------
 @app.get("/", summary="Root (avoid Render HEAD / 404 noise)")
@@ -286,7 +257,9 @@ async def root() -> Dict[str, Any]:
 
 @app.get("/health", summary="Basic health check")
 async def health() -> Dict[str, Any]:
-    provider = get_default_provider()
+    # NOTE: get_default_provider may return dict OR Provider object. Normalize.
+    provider_raw = get_default_provider()
+    provider = _provider_dict(provider_raw)
 
     # Redis status should never crash health.
     redis_ok = False
@@ -305,6 +278,7 @@ async def health() -> Dict[str, Any]:
         "env": _env(),
         "service": "stegtvc",
         "version": settings.version,
+        "public_url": _public_url() or provider.get("endpoint") or "",
         "default_provider": {
             "name": provider.get("name"),
             "model": provider.get("model"),
@@ -323,12 +297,6 @@ async def health() -> Dict[str, Any]:
             "ok": redis_ok,
         },
     }
-
-    # Only include public_url if explicitly set (avoid leaking internal/3rd-party endpoints)
-    pu = _public_url()
-    if pu:
-        payload["public_url"] = pu
-
     return payload
 
 
@@ -347,10 +315,14 @@ async def providers_resolve(body: ProviderResolveRequest) -> ProviderResolveResp
     summary="Return the currently configured default provider/model.",
 )
 async def providers_default() -> ProviderInfo:
-    base = get_default_provider()
+    # Keep using ProviderInfo response model
+    # but normalize provider shape safely.
+    base_raw = get_default_provider()
+    base = _provider_dict(base_raw)
+
     return ProviderInfo(
-        name=base["name"],
-        model=base["model"],
+        name=str(base.get("name") or ""),
+        model=str(base.get("model") or ""),
         endpoint=base.get("endpoint"),
         notes=base.get("notes"),
     )
