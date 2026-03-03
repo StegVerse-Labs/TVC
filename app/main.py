@@ -1,13 +1,12 @@
-# app/main.py
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 import uuid
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from .config import get_settings, get_default_provider
@@ -62,7 +61,21 @@ def _jwt_secret() -> str:
     return secret
 
 
-def _admin_token_expected() -> str:
+def _jwt_secret_fingerprint(secret: str) -> str:
+    # Safe: does not reveal secret; helps detect “different secret per instance/env”
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:10]
+
+
+def _jwt_leeway_seconds() -> int:
+    raw = (os.getenv("STEGTV_JWT_LEEWAY_SECONDS") or "5").strip()
+    try:
+        v = int(raw)
+    except Exception:
+        v = 5
+    return max(0, min(v, 30))
+
+
+def _admin_token() -> str:
     # Prefer STEGTV_ADMIN_TOKEN, allow legacy ADMIN_TOKEN fallback.
     tok = (os.getenv("STEGTV_ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") or "").strip()
     if not tok:
@@ -71,12 +84,10 @@ def _admin_token_expected() -> str:
 
 
 def _env() -> str:
-    # Your config.py uses ENV already; keep consistent.
     return (os.getenv("ENV") or "production").strip().lower()
 
 
 def _docs_enabled() -> bool:
-    # Only enable docs in dev-like envs.
     return _env() in ("dev", "development", "local")
 
 
@@ -89,44 +100,12 @@ def _redis_url() -> str:
 
 
 def _verify_grace_seconds() -> int:
-    # Sliding window for internal flows (admin-only).
     raw = (os.getenv("STEGTV_VERIFY_GRACE_SECONDS") or "30").strip()
     try:
         v = int(raw)
     except Exception:
         v = 30
     return max(0, min(v, 300))
-
-
-def _provider_to_dict(p: Any) -> Dict[str, Any]:
-    """
-    Normalizes provider representations:
-    - dict -> dict
-    - pydantic model -> model_dump()
-    - dataclass / object with attrs -> attr dict
-    """
-    if p is None:
-        return {}
-    if isinstance(p, dict):
-        return p
-    # pydantic v2
-    if hasattr(p, "model_dump") and callable(getattr(p, "model_dump")):
-        try:
-            return dict(p.model_dump())
-        except Exception:
-            pass
-    # pydantic v1 fallback
-    if hasattr(p, "dict") and callable(getattr(p, "dict")):
-        try:
-            return dict(p.dict())
-        except Exception:
-            pass
-    # attribute-based object
-    out: Dict[str, Any] = {}
-    for k in ("name", "model", "endpoint", "priority", "notes"):
-        if hasattr(p, k):
-            out[k] = getattr(p, k)
-    return out
 
 
 # ------------------------
@@ -182,14 +161,11 @@ async def _bump_rev_epoch() -> int:
 
 
 # ------------------------
-# Admin auth (Swagger "Authorize")
+# Auth dependency
 # ------------------------
-api_key_scheme = APIKeyHeader(name="X-Admin-Token", auto_error=False)
-
-
-async def require_admin(api_key: Optional[str] = Depends(api_key_scheme)) -> None:
-    expected = _admin_token_expected()
-    presented = (api_key or "").strip()
+async def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> None:
+    expected = _admin_token()
+    presented = (x_admin_token or "").strip()
     if not presented or presented != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -252,16 +228,9 @@ async def root() -> Dict[str, Any]:
     return {"status": "ok", "service": "stegtvc", "env": _env(), "version": settings.version}
 
 
-@app.head("/", include_in_schema=False)
-async def root_head() -> None:
-    # Render/health probes often use HEAD; return 200 with no body.
-    return None
-
-
 @app.get("/health", summary="Basic health check")
 async def health() -> Dict[str, Any]:
-    provider_any = get_default_provider()
-    provider = _provider_to_dict(provider_any)
+    provider = get_default_provider()
 
     redis_ok = False
     redis_configured = bool(_redis_url())
@@ -269,20 +238,28 @@ async def health() -> Dict[str, Any]:
         r = await _get_redis()
         if r is not None:
             try:
-                redis_ok = bool(await r.ping())
+                pong = await r.ping()
+                redis_ok = bool(pong)
             except Exception:
                 redis_ok = False
+
+    fp = None
+    if jwt is not None:
+        try:
+            fp = _jwt_secret_fingerprint(_jwt_secret())
+        except Exception:
+            fp = None
 
     payload = {
         "status": "ok",
         "env": _env(),
         "service": "stegtvc",
         "version": settings.version,
-        "public_url": _public_url() or "",
+        "public_url": _public_url() or settings.default_provider.get("endpoint", ""),
         "default_provider": {
-            "name": provider.get("name"),
-            "model": provider.get("model"),
-            "endpoint": provider.get("endpoint"),
+            "name": provider.get("name") if isinstance(provider, dict) else getattr(provider, "name", None),
+            "model": provider.get("model") if isinstance(provider, dict) else getattr(provider, "model", None),
+            "endpoint": provider.get("endpoint") if isinstance(provider, dict) else getattr(provider, "endpoint", None),
         },
         "security": {
             "admin_header": "X-Admin-Token",
@@ -290,6 +267,8 @@ async def health() -> Dict[str, Any]:
             "token_ttl_max_seconds": 300,
             "revocation_epoch": await _get_rev_epoch(),
             "jwt_signing": "HS256 (env: STEGTV_JWT_SECRET)",
+            "jwt_secret_fingerprint": fp,
+            "jwt_leeway_seconds": _jwt_leeway_seconds(),
             "verify_grace_seconds": _verify_grace_seconds(),
         },
         "redis": {
@@ -315,13 +294,20 @@ async def providers_resolve(body: ProviderResolveRequest) -> ProviderResolveResp
     summary="Return the currently configured default provider/model.",
 )
 async def providers_default() -> ProviderInfo:
-    base_any = get_default_provider()
-    base = _provider_to_dict(base_any)
+    base = get_default_provider()
+    # base might be dict or a pydantic/model object depending on your code
+    if isinstance(base, dict):
+        return ProviderInfo(
+            name=base["name"],
+            model=base["model"],
+            endpoint=base.get("endpoint"),
+            notes=base.get("notes"),
+        )
     return ProviderInfo(
-        name=base.get("name"),
-        model=base.get("model"),
-        endpoint=base.get("endpoint"),
-        notes=base.get("notes"),
+        name=getattr(base, "name", None),
+        model=getattr(base, "model", None),
+        endpoint=getattr(base, "endpoint", None),
+        notes=getattr(base, "notes", None),
     )
 
 
@@ -375,40 +361,58 @@ async def tokens_issue(body: TokenIssueRequest) -> TokenIssueResponse:
 async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
     _require_jwt()
     secret = _jwt_secret()
+    leeway = _jwt_leeway_seconds()
 
+    # 1) Strict verify (with small leeway)
     try:
-        claims = jwt.decode(body.token, secret, algorithms=["HS256"])
+        claims = jwt.decode(body.token, secret, algorithms=["HS256"], leeway=leeway)
     except Exception as e:
-        # Sliding-window path: allow slight expiry for internal flows (admin-only).
+        # 2) Grace-window path: allow slight expiry for internal flows (admin-only).
         grace = _verify_grace_seconds()
-        if grace > 0:
-            try:
-                claims2 = jwt.decode(
-                    body.token,
-                    secret,
-                    algorithms=["HS256"],
-                    options={"verify_exp": False},
+        try:
+            # decode claims without exp check (signature still verified)
+            claims2 = jwt.decode(
+                body.token,
+                secret,
+                algorithms=["HS256"],
+                options={"verify_exp": False},
+            )
+        except Exception as e2:
+            # If we can't even decode without exp verification, it's likely signature/secret mismatch.
+            return TokenVerifyResponse(
+                valid=False,
+                claims=None,
+                reason=f"decode_failed: {e} (noexp_decode_failed: {e2})",
+            )
+
+        # diagnostics
+        server_now = _now()
+        exp = int(claims2.get("exp", 0) or 0)
+        delta = exp - server_now if exp else None
+
+        if grace > 0 and exp and server_now <= exp + grace:
+            # Still must satisfy revocation epoch.
+            cur_rev = await _get_rev_epoch()
+            tok_rev = int(claims2.get("rev", -1))
+            if tok_rev != cur_rev:
+                return TokenVerifyResponse(
+                    valid=False,
+                    claims=claims2,
+                    reason=f"revoked: token_rev={tok_rev} current_rev={cur_rev}",
                 )
-                exp = int(claims2.get("exp", 0) or 0)
-                if exp and _now() <= exp + grace:
-                    cur_rev = await _get_rev_epoch()
-                    tok_rev = int(claims2.get("rev", -1))
-                    if tok_rev != cur_rev:
-                        return TokenVerifyResponse(
-                            valid=False,
-                            claims=claims2,
-                            reason=f"revoked: token_rev={tok_rev} current_rev={cur_rev}",
-                        )
-                    return TokenVerifyResponse(
-                        valid=True,
-                        claims=claims2,
-                        reason=f"expired_but_within_grace:{grace}s",
-                    )
-            except Exception:
-                pass
+            return TokenVerifyResponse(
+                valid=True,
+                claims=claims2,
+                reason=f"expired_but_within_grace:{grace}s (leeway={leeway}s, delta={delta})",
+            )
 
-        return TokenVerifyResponse(valid=False, claims=None, reason=f"decode_failed: {e}")
+        return TokenVerifyResponse(
+            valid=False,
+            claims=claims2,
+            reason=f"decode_failed: {e} (server_now={server_now}, token_exp={exp}, delta={delta}, leeway={leeway}, grace={grace})",
+        )
 
+    # Revocation check
     cur_rev = await _get_rev_epoch()
     tok_rev = int(claims.get("rev", -1))
     if tok_rev != cur_rev:
