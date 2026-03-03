@@ -1,10 +1,12 @@
 # app/config.py
 import json
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "stegtv_config.json")
+HERE = os.path.dirname(__file__)
+CONFIG_PATH = os.path.join(HERE, "stegtv_config.json")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "providers": [
@@ -33,32 +35,47 @@ def load_stegtv_config() -> Dict[str, Any]:
 
 
 def get_default_provider(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Returns the highest-priority provider from config.
-    """
     cfg = cfg or load_stegtv_config()
     providers: List[Dict[str, Any]] = cfg.get("providers", []) or []
     if not providers:
         return DEFAULT_CONFIG["providers"][0]
 
-    # lowest priority number wins; missing priority defaults to 9999
     providers_sorted = sorted(providers, key=lambda p: int(p.get("priority", 9999)))
     return providers_sorted[0]
 
 
+@dataclass(frozen=True)
+class Settings:
+    # app identity
+    name: str = "TVC"
+    version: str = "0.1.0"
+    env: str = "production"
+
+    # config + provider
+    config: Dict[str, Any] = None  # type: ignore
+    default_provider: Dict[str, Any] = None  # type: ignore
+
+    # secrets (optional; don’t block boot)
+    STEGTV_JWT_SECRET: str = ""
+    GITHUB_MODELS_TOKEN: str = ""
+    ADMIN_TOKEN: str = ""
+
+
 @lru_cache(maxsize=1)
-def get_settings() -> Dict[str, Any]:
-    """
-    Lightweight "settings" object (dict) so main.py can import get_settings().
-    We keep it simple: config from file + relevant env vars.
-    """
+def get_settings() -> Settings:
     cfg = load_stegtv_config()
-    return {
-        "config": cfg,
-        "default_provider": get_default_provider(cfg),
-        # Optional secrets (don’t require them to boot)
-        "STEGTV_JWT_SECRET": os.getenv("STEGTV_JWT_SECRET", ""),
-        "GITHUB_MODELS_TOKEN": os.getenv("GITHUB_MODELS_TOKEN", ""),
-        "ADMIN_TOKEN": os.getenv("ADMIN_TOKEN", ""),
-        "ENV": os.getenv("ENV", "production"),
-    }
+    provider = get_default_provider(cfg)
+
+    # version can be overridden from env without touching code
+    version = os.getenv("APP_VERSION", "0.1.0")
+
+    return Settings(
+        name=os.getenv("APP_NAME", "TVC"),
+        version=version,
+        env=os.getenv("ENV", "production"),
+        config=cfg,
+        default_provider=provider,
+        STEGTV_JWT_SECRET=os.getenv("STEGTV_JWT_SECRET", ""),
+        GITHUB_MODELS_TOKEN=os.getenv("GITHUB_MODELS_TOKEN", ""),
+        ADMIN_TOKEN=os.getenv("ADMIN_TOKEN", ""),
+    )
