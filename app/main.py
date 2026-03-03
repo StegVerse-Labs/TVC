@@ -7,6 +7,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from .config import get_settings, get_default_provider
@@ -38,7 +39,7 @@ def _clamp_ttl(ttl_seconds: int) -> int:
     # Ephemeral means minutes.
     if ttl_seconds <= 0:
         return 120
-    return max(10, min(ttl_seconds, 300))
+    return max(10, min(int(ttl_seconds), 300))
 
 
 def _require_jwt() -> None:
@@ -61,7 +62,7 @@ def _jwt_secret() -> str:
     return secret
 
 
-def _admin_token() -> str:
+def _admin_token_expected() -> str:
     # Prefer STEGTV_ADMIN_TOKEN, allow legacy ADMIN_TOKEN fallback.
     tok = (os.getenv("STEGTV_ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") or "").strip()
     if not tok:
@@ -70,12 +71,12 @@ def _admin_token() -> str:
 
 
 def _env() -> str:
-    # Use ENV as you confirmed in Render.
+    # Your config.py uses ENV already; keep consistent.
     return (os.getenv("ENV") or "production").strip().lower()
 
 
 def _docs_enabled() -> bool:
-    # Enable docs only in dev-like envs.
+    # Only enable docs in dev-like envs.
     return _env() in ("dev", "development", "local")
 
 
@@ -97,40 +98,34 @@ def _verify_grace_seconds() -> int:
     return max(0, min(v, 300))
 
 
-def _provider_dict(p: Any) -> Dict[str, Any]:
+def _provider_to_dict(p: Any) -> Dict[str, Any]:
     """
-    Normalize provider into a dict safely.
-    Supports:
-      - dict
-      - Pydantic v2 model (model_dump)
-      - dataclass / object with attributes (vars/getattr)
+    Normalizes provider representations:
+    - dict -> dict
+    - pydantic model -> model_dump()
+    - dataclass / object with attrs -> attr dict
     """
     if p is None:
         return {}
     if isinstance(p, dict):
         return p
-    # Pydantic v2
-    md = getattr(p, "model_dump", None)
-    if callable(md):
+    # pydantic v2
+    if hasattr(p, "model_dump") and callable(getattr(p, "model_dump")):
         try:
-            d = md()
-            if isinstance(d, dict):
-                return d
+            return dict(p.model_dump())
         except Exception:
             pass
-    # dataclass / plain object
-    try:
-        d2 = vars(p)
-        if isinstance(d2, dict):
-            return d2
-    except Exception:
-        pass
-    # best-effort attribute pull
+    # pydantic v1 fallback
+    if hasattr(p, "dict") and callable(getattr(p, "dict")):
+        try:
+            return dict(p.dict())
+        except Exception:
+            pass
+    # attribute-based object
     out: Dict[str, Any] = {}
     for k in ("name", "model", "endpoint", "priority", "notes"):
-        v = getattr(p, k, None)
-        if v is not None:
-            out[k] = v
+        if hasattr(p, k):
+            out[k] = getattr(p, k)
     return out
 
 
@@ -151,7 +146,6 @@ async def _get_redis() -> Optional["redis_async.Redis"]:
     if redis_async is None:
         return None
 
-    # decode_responses=True returns strings instead of bytes
     _redis = redis_async.from_url(url, decode_responses=True)
     return _redis
 
@@ -188,11 +182,14 @@ async def _bump_rev_epoch() -> int:
 
 
 # ------------------------
-# Auth dependency
+# Admin auth (Swagger "Authorize")
 # ------------------------
-async def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> None:
-    expected = _admin_token()
-    presented = (x_admin_token or "").strip()
+api_key_scheme = APIKeyHeader(name="X-Admin-Token", auto_error=False)
+
+
+async def require_admin(api_key: Optional[str] = Depends(api_key_scheme)) -> None:
+    expected = _admin_token_expected()
+    presented = (api_key or "").strip()
     if not presented or presented != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -255,30 +252,33 @@ async def root() -> Dict[str, Any]:
     return {"status": "ok", "service": "stegtvc", "env": _env(), "version": settings.version}
 
 
+@app.head("/", include_in_schema=False)
+async def root_head() -> None:
+    # Render/health probes often use HEAD; return 200 with no body.
+    return None
+
+
 @app.get("/health", summary="Basic health check")
 async def health() -> Dict[str, Any]:
-    # NOTE: get_default_provider may return dict OR Provider object. Normalize.
-    provider_raw = get_default_provider()
-    provider = _provider_dict(provider_raw)
+    provider_any = get_default_provider()
+    provider = _provider_to_dict(provider_any)
 
-    # Redis status should never crash health.
     redis_ok = False
     redis_configured = bool(_redis_url())
     if redis_configured:
         r = await _get_redis()
         if r is not None:
             try:
-                pong = await r.ping()
-                redis_ok = bool(pong)
+                redis_ok = bool(await r.ping())
             except Exception:
                 redis_ok = False
 
-    payload: Dict[str, Any] = {
+    payload = {
         "status": "ok",
         "env": _env(),
         "service": "stegtvc",
         "version": settings.version,
-        "public_url": _public_url() or provider.get("endpoint") or "",
+        "public_url": _public_url() or "",
         "default_provider": {
             "name": provider.get("name"),
             "model": provider.get("model"),
@@ -315,14 +315,11 @@ async def providers_resolve(body: ProviderResolveRequest) -> ProviderResolveResp
     summary="Return the currently configured default provider/model.",
 )
 async def providers_default() -> ProviderInfo:
-    # Keep using ProviderInfo response model
-    # but normalize provider shape safely.
-    base_raw = get_default_provider()
-    base = _provider_dict(base_raw)
-
+    base_any = get_default_provider()
+    base = _provider_to_dict(base_any)
     return ProviderInfo(
-        name=str(base.get("name") or ""),
-        model=str(base.get("model") or ""),
+        name=base.get("name"),
+        model=base.get("model"),
         endpoint=base.get("endpoint"),
         notes=base.get("notes"),
     )
@@ -379,7 +376,6 @@ async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
     _require_jwt()
     secret = _jwt_secret()
 
-    # Normal verify path
     try:
         claims = jwt.decode(body.token, secret, algorithms=["HS256"])
     except Exception as e:
@@ -395,7 +391,6 @@ async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
                 )
                 exp = int(claims2.get("exp", 0) or 0)
                 if exp and _now() <= exp + grace:
-                    # Still must satisfy revocation epoch.
                     cur_rev = await _get_rev_epoch()
                     tok_rev = int(claims2.get("rev", -1))
                     if tok_rev != cur_rev:
@@ -414,7 +409,6 @@ async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
 
         return TokenVerifyResponse(valid=False, claims=None, reason=f"decode_failed: {e}")
 
-    # Revocation check
     cur_rev = await _get_rev_epoch()
     tok_rev = int(claims.get("rev", -1))
     if tok_rev != cur_rev:
