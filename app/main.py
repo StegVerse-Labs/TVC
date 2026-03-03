@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import time
 import uuid
@@ -61,20 +60,6 @@ def _jwt_secret() -> str:
     return secret
 
 
-def _jwt_secret_fingerprint(secret: str) -> str:
-    # Safe: does not reveal secret; helps detect “different secret per instance/env”
-    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:10]
-
-
-def _jwt_leeway_seconds() -> int:
-    raw = (os.getenv("STEGTV_JWT_LEEWAY_SECONDS") or "5").strip()
-    try:
-        v = int(raw)
-    except Exception:
-        v = 5
-    return max(0, min(v, 30))
-
-
 def _admin_token() -> str:
     # Prefer STEGTV_ADMIN_TOKEN, allow legacy ADMIN_TOKEN fallback.
     tok = (os.getenv("STEGTV_ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") or "").strip()
@@ -84,10 +69,12 @@ def _admin_token() -> str:
 
 
 def _env() -> str:
+    # Keep consistent with config.py which uses ENV.
     return (os.getenv("ENV") or "production").strip().lower()
 
 
 def _docs_enabled() -> bool:
+    # Only enable docs in dev-like envs.
     return _env() in ("dev", "development", "local")
 
 
@@ -100,12 +87,63 @@ def _redis_url() -> str:
 
 
 def _verify_grace_seconds() -> int:
+    # Sliding window for internal flows (admin-only).
     raw = (os.getenv("STEGTV_VERIFY_GRACE_SECONDS") or "30").strip()
     try:
         v = int(raw)
     except Exception:
         v = 30
     return max(0, min(v, 300))
+
+
+def _jwt_leeway_seconds() -> int:
+    """
+    Small leeway for exp/nbf checks to tolerate minor clock skew across instances/CDN edges.
+    This is separate from the grace path (which only applies when already expired).
+    """
+    raw = (os.getenv("STEGTV_JWT_LEEWAY_SECONDS") or "5").strip()
+    try:
+        v = int(raw)
+    except Exception:
+        v = 5
+    return max(0, min(v, 60))
+
+
+def _provider_to_dict(p: Any) -> Dict[str, Any]:
+    """
+    Normalize provider config for health responses.
+    Works with dict, pydantic models, dataclasses-ish objects.
+    """
+    if p is None:
+        return {}
+    if isinstance(p, dict):
+        return p
+    # Pydantic v2
+    if hasattr(p, "model_dump"):
+        try:
+            d = p.model_dump()
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+    # Pydantic v1
+    if hasattr(p, "dict"):
+        try:
+            d = p.dict()
+            if isinstance(d, dict):
+                return d
+        except Exception:
+            pass
+
+    # Fallback: pull common attributes
+    out: Dict[str, Any] = {}
+    for k in ("name", "model", "endpoint", "notes"):
+        if hasattr(p, k):
+            try:
+                out[k] = getattr(p, k)
+            except Exception:
+                pass
+    return out
 
 
 # ------------------------
@@ -123,8 +161,10 @@ async def _get_redis() -> Optional["redis_async.Redis"]:
     if not url:
         return None
     if redis_async is None:
+        # redis lib not installed; act like redis is absent.
         return None
 
+    # decode_responses=True returns strings instead of bytes
     _redis = redis_async.from_url(url, decode_responses=True)
     return _redis
 
@@ -141,12 +181,14 @@ async def _get_rev_epoch() -> int:
             return 0
         return int(v)
     except Exception:
+        # If redis is flaky, fall back to process env epoch.
         return int(os.getenv("STEGTV_REV_EPOCH", "0") or 0)
 
 
 async def _bump_rev_epoch() -> int:
     r = await _get_redis()
     if r is None:
+        # Process-local fallback (not shared across instances).
         cur = int(os.getenv("STEGTV_REV_EPOCH", "0") or 0) + 1
         os.environ["STEGTV_REV_EPOCH"] = str(cur)
         return cur
@@ -220,6 +262,38 @@ app = FastAPI(
 )
 
 
+# Add Swagger "Authorize" (only matters when docs enabled)
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})
+    schema["components"]["securitySchemes"]["AdminToken"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Admin-Token",
+        "description": "Admin token required for /tokens/* endpoints",
+    }
+    # Mark only the /tokens/* endpoints as requiring AdminToken (UI lock icon + Authorize button)
+    for path, methods in schema.get("paths", {}).items():
+        if path.startswith("/tokens/"):
+            for _, op in methods.items():
+                if isinstance(op, dict):
+                    op.setdefault("security", [{"AdminToken": []}])
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
 # ------------------------
 # Routes
 # ------------------------
@@ -230,8 +304,14 @@ async def root() -> Dict[str, Any]:
 
 @app.get("/health", summary="Basic health check")
 async def health() -> Dict[str, Any]:
-    provider = get_default_provider()
+    # Default provider can be dict or model — normalize it.
+    provider_raw = get_default_provider()
+    provider = _provider_to_dict(provider_raw)
 
+    # settings.default_provider can also be dict or model — normalize it too.
+    settings_default = _provider_to_dict(getattr(settings, "default_provider", None))
+
+    # Redis status should never crash health.
     redis_ok = False
     redis_configured = bool(_redis_url())
     if redis_configured:
@@ -243,23 +323,16 @@ async def health() -> Dict[str, Any]:
             except Exception:
                 redis_ok = False
 
-    fp = None
-    if jwt is not None:
-        try:
-            fp = _jwt_secret_fingerprint(_jwt_secret())
-        except Exception:
-            fp = None
-
     payload = {
         "status": "ok",
         "env": _env(),
         "service": "stegtvc",
         "version": settings.version,
-        "public_url": _public_url() or settings.default_provider.get("endpoint", ""),
+        "public_url": _public_url() or (settings_default.get("endpoint") or provider.get("endpoint") or ""),
         "default_provider": {
-            "name": provider.get("name") if isinstance(provider, dict) else getattr(provider, "name", None),
-            "model": provider.get("model") if isinstance(provider, dict) else getattr(provider, "model", None),
-            "endpoint": provider.get("endpoint") if isinstance(provider, dict) else getattr(provider, "endpoint", None),
+            "name": provider.get("name"),
+            "model": provider.get("model"),
+            "endpoint": provider.get("endpoint"),
         },
         "security": {
             "admin_header": "X-Admin-Token",
@@ -267,13 +340,15 @@ async def health() -> Dict[str, Any]:
             "token_ttl_max_seconds": 300,
             "revocation_epoch": await _get_rev_epoch(),
             "jwt_signing": "HS256 (env: STEGTV_JWT_SECRET)",
-            "jwt_secret_fingerprint": fp,
-            "jwt_leeway_seconds": _jwt_leeway_seconds(),
             "verify_grace_seconds": _verify_grace_seconds(),
+            "jwt_leeway_seconds": _jwt_leeway_seconds(),
         },
         "redis": {
             "configured": redis_configured,
             "ok": redis_ok,
+        },
+        "time": {
+            "now_unix": _now(),
         },
     }
     return payload
@@ -294,20 +369,12 @@ async def providers_resolve(body: ProviderResolveRequest) -> ProviderResolveResp
     summary="Return the currently configured default provider/model.",
 )
 async def providers_default() -> ProviderInfo:
-    base = get_default_provider()
-    # base might be dict or a pydantic/model object depending on your code
-    if isinstance(base, dict):
-        return ProviderInfo(
-            name=base["name"],
-            model=base["model"],
-            endpoint=base.get("endpoint"),
-            notes=base.get("notes"),
-        )
+    base = _provider_to_dict(get_default_provider())
     return ProviderInfo(
-        name=getattr(base, "name", None),
-        model=getattr(base, "model", None),
-        endpoint=getattr(base, "endpoint", None),
-        notes=getattr(base, "notes", None),
+        name=base.get("name"),
+        model=base.get("model"),
+        endpoint=base.get("endpoint"),
+        notes=base.get("notes"),
     )
 
 
@@ -361,56 +428,43 @@ async def tokens_issue(body: TokenIssueRequest) -> TokenIssueResponse:
 async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
     _require_jwt()
     secret = _jwt_secret()
+
     leeway = _jwt_leeway_seconds()
 
-    # 1) Strict verify (with small leeway)
+    # Normal verify path (with small leeway for clock skew)
     try:
         claims = jwt.decode(body.token, secret, algorithms=["HS256"], leeway=leeway)
     except Exception as e:
-        # 2) Grace-window path: allow slight expiry for internal flows (admin-only).
+        # Sliding-window path: allow slight expiry for internal flows (admin-only).
         grace = _verify_grace_seconds()
-        try:
-            # decode claims without exp check (signature still verified)
-            claims2 = jwt.decode(
-                body.token,
-                secret,
-                algorithms=["HS256"],
-                options={"verify_exp": False},
-            )
-        except Exception as e2:
-            # If we can't even decode without exp verification, it's likely signature/secret mismatch.
-            return TokenVerifyResponse(
-                valid=False,
-                claims=None,
-                reason=f"decode_failed: {e} (noexp_decode_failed: {e2})",
-            )
-
-        # diagnostics
-        server_now = _now()
-        exp = int(claims2.get("exp", 0) or 0)
-        delta = exp - server_now if exp else None
-
-        if grace > 0 and exp and server_now <= exp + grace:
-            # Still must satisfy revocation epoch.
-            cur_rev = await _get_rev_epoch()
-            tok_rev = int(claims2.get("rev", -1))
-            if tok_rev != cur_rev:
-                return TokenVerifyResponse(
-                    valid=False,
-                    claims=claims2,
-                    reason=f"revoked: token_rev={tok_rev} current_rev={cur_rev}",
+        if grace > 0:
+            try:
+                claims2 = jwt.decode(
+                    body.token,
+                    secret,
+                    algorithms=["HS256"],
+                    options={"verify_exp": False},
                 )
-            return TokenVerifyResponse(
-                valid=True,
-                claims=claims2,
-                reason=f"expired_but_within_grace:{grace}s (leeway={leeway}s, delta={delta})",
-            )
+                exp = int(claims2.get("exp", 0) or 0)
+                if exp and _now() <= exp + grace:
+                    # Still must satisfy revocation epoch.
+                    cur_rev = await _get_rev_epoch()
+                    tok_rev = int(claims2.get("rev", -1))
+                    if tok_rev != cur_rev:
+                        return TokenVerifyResponse(
+                            valid=False,
+                            claims=claims2,
+                            reason=f"revoked: token_rev={tok_rev} current_rev={cur_rev}",
+                        )
+                    return TokenVerifyResponse(
+                        valid=True,
+                        claims=claims2,
+                        reason=f"expired_but_within_grace:{grace}s",
+                    )
+            except Exception:
+                pass
 
-        return TokenVerifyResponse(
-            valid=False,
-            claims=claims2,
-            reason=f"decode_failed: {e} (server_now={server_now}, token_exp={exp}, delta={delta}, leeway={leeway}, grace={grace})",
-        )
+        return TokenVerifyResponse(valid=False, claims=None, reason=f"decode_failed: {e}")
 
     # Revocation check
     cur_rev = await _get_rev_epoch()
