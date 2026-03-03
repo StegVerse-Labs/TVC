@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import os
 import time
 import uuid
@@ -9,9 +10,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .config import get_settings, get_default_provider
 from .models import ProviderResolveRequest, ProviderResolveResponse, ProviderInfo
 from .services import resolve_provider
-from .config import get_settings  # your existing config.py
 
 # --- Optional dependency: PyJWT ---
 try:
@@ -20,23 +21,59 @@ except Exception as e:  # pragma: no cover
     jwt = None
     _jwt_import_error = e
 
-# --- Redis (async) ---
+# --- Optional dependency: redis (async) ---
 try:
     import redis.asyncio as redis  # type: ignore
-except Exception as e:  # pragma: no cover
-    redis = None
-    _redis_import_error = e
+except Exception:
+    redis = None  # pragma: no cover
 
 
-# ----------------------------
-# Env / toggles
-# ----------------------------
+# ------------------------
+# Helpers / Settings
+# ------------------------
+def _now() -> int:
+    return int(time.time())
+
+
 def _env() -> str:
-    return (os.getenv("ENV", "prod") or "prod").strip().lower()
+    # Your config.py uses ENV; keep that canonical.
+    return (os.getenv("ENV", "") or get_settings().env or "production").strip().lower()
 
 
-def _is_dev() -> bool:
-    return _env() in {"dev", "development", "local"}
+def _is_prod() -> bool:
+    return _env() in ("prod", "production")
+
+
+def _docs_enabled() -> bool:
+    # Default: enabled in dev, disabled in prod
+    v = os.getenv("STEGTV_DOCS", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return not _is_prod()
+
+
+def _admin_token_value() -> str:
+    # You added STEGTV_ADMIN_TOKEN in Render; support both for compatibility.
+    return (
+        os.getenv("STEGTV_ADMIN_TOKEN", "").strip()
+        or os.getenv("ADMIN_TOKEN", "").strip()
+        or get_settings().ADMIN_TOKEN.strip()
+    )
+
+
+def _const_time_eq(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> None:
+    expected = _admin_token_value()
+    if not expected:
+        # If you haven't set an admin token, do NOT allow token endpoints to function.
+        raise HTTPException(status_code=503, detail="Admin token not configured (set STEGTV_ADMIN_TOKEN).")
+    if not x_admin_token or not _const_time_eq(x_admin_token.strip(), expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def _require_jwt() -> None:
@@ -51,143 +88,113 @@ def _require_jwt() -> None:
 
 
 def _jwt_secret() -> str:
-    secret = (os.getenv("STEGTV_JWT_SECRET", "") or "").strip()
+    secret = os.getenv("STEGTV_JWT_SECRET", "").strip()
     if not secret:
         raise HTTPException(status_code=500, detail="Missing env var STEGTV_JWT_SECRET.")
     if len(secret) < 16:
-        raise HTTPException(status_code=500, detail="STEGTV_JWT_SECRET too short (min 16 chars recommended).")
+        raise HTTPException(status_code=500, detail="STEGTV_JWT_SECRET is too short (min 16 chars recommended).")
     return secret
 
 
-def _admin_token() -> str:
-    # You set STEGTV_ADMIN_TOKEN on Render — good. Keep ADMIN_TOKEN as fallback.
-    tok = (os.getenv("STEGTV_ADMIN_TOKEN") or os.getenv("ADMIN_TOKEN") or "").strip()
-    if not tok:
-        raise HTTPException(status_code=500, detail="Missing env var STEGTV_ADMIN_TOKEN (or ADMIN_TOKEN).")
-    return tok
+def _clamp_ttl(ttl_seconds: int) -> int:
+    # Ephemeral by default: minutes, not hours.
+    if ttl_seconds <= 0:
+        return 120
+    return max(10, min(ttl_seconds, int(os.getenv("STEGTV_TTL_MAX", "300"))))
 
 
 def _jwt_leeway_seconds() -> int:
-    # Sliding-window grace for exp checks (internal flows). Keep small.
+    # Small clock skew tolerance
     try:
-        v = int(os.getenv("JWT_LEEWAY_SECONDS", "10"))
+        return max(0, min(int(os.getenv("STEGTV_JWT_LEEWAY", "5")), 60))
     except Exception:
-        v = 10
-    return max(0, min(v, 60))
+        return 5
+
+
+def _sliding_enabled() -> bool:
+    v = os.getenv("STEGTV_SLIDING_ENABLED", "true").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _sliding_grace_seconds() -> int:
+    # Allow a brief post-expiration grace ONLY for internal flows.
+    try:
+        return max(0, min(int(os.getenv("STEGTV_SLIDING_GRACE", "30")), 300))
+    except Exception:
+        return 30
+
+
+def _refresh_if_under_seconds() -> int:
+    # If token is going to expire in <= N seconds, mint a refreshed token.
+    try:
+        return max(0, min(int(os.getenv("STEGTV_REFRESH_UNDER", "20")), 120))
+    except Exception:
+        return 20
 
 
 def _redis_url() -> str:
-    # Render Redis typically provides REDIS_URL or you can set it manually.
-    # Use whichever you prefer; we accept either.
-    return (os.getenv("REDIS_URL") or os.getenv("STEGTV_REDIS_URL") or "").strip()
+    return os.getenv("REDIS_URL", "").strip() or os.getenv("STEGTV_REDIS_URL", "").strip()
 
 
-def _now() -> int:
-    return int(time.time())
-
-
-def _clamp_ttl(ttl_seconds: int) -> int:
-    # Ephemeral means minutes, not hours.
-    if ttl_seconds <= 0:
-        return 120
-    return max(10, min(ttl_seconds, 300))
-
-
-# ----------------------------
-# Redis helpers (revocation + rate limit)
-# ----------------------------
-_R: Optional["redis.Redis"] = None  # lazy singleton
-
-
-async def _get_redis() -> "redis.Redis":
-    global _R
+async def _get_redis():
     if redis is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"redis package not installed. Add `redis` to requirements.txt. Import error: {_redis_import_error}",
-        )
-
+        return None
     url = _redis_url()
     if not url:
-        raise HTTPException(status_code=500, detail="Missing REDIS_URL (or STEGTV_REDIS_URL).")
+        return None
+    try:
+        r = redis.from_url(url, decode_responses=True)
+        # quick ping
+        await r.ping()
+        return r
+    except Exception:
+        return None
 
-    if _R is None:
-        _R = redis.from_url(url, decode_responses=True)
-    return _R
+
+# ------------------------
+# Redis-backed rev epoch
+# ------------------------
+_REV_EPOCH_LOCAL: int = 0
+REV_EPOCH_KEY = "stegtvc:rev_epoch"
 
 
-async def _get_rev_epoch(r: "redis.Redis") -> int:
-    key = "stegtvc:rev_epoch"
-    val = await r.get(key)
-    if val is None:
-        # initialize safely
-        await r.set(key, "0", nx=True)
+async def _get_rev_epoch() -> int:
+    r = await _get_redis()
+    if not r:
+        return _REV_EPOCH_LOCAL
+    val = await r.get(REV_EPOCH_KEY)
+    if not val:
+        await r.set(REV_EPOCH_KEY, "0")
         return 0
     try:
         return int(val)
     except Exception:
-        # if corrupted, reset to 0 (safe default)
-        await r.set(key, "0")
+        await r.set(REV_EPOCH_KEY, "0")
         return 0
 
 
-async def _bump_rev_epoch(r: "redis.Redis") -> int:
-    key = "stegtvc:rev_epoch"
-    # Atomic increment
-    new_val = await r.incr(key)
-    return int(new_val)
+async def _bump_rev_epoch() -> int:
+    global _REV_EPOCH_LOCAL
+    r = await _get_redis()
+    if not r:
+        _REV_EPOCH_LOCAL += 1
+        return _REV_EPOCH_LOCAL
+    # atomic increment
+    return int(await r.incr(REV_EPOCH_KEY))
 
 
-async def _rate_limit_or_429(
-    request: Request,
-    r: "redis.Redis",
-    *,
-    bucket: str,
-    limit: int,
-    window_seconds: int,
-) -> None:
-    """
-    Redis-backed fixed window limiter:
-      key = steg:rl:{bucket}:{client_ip}:{window_start}
-    """
-    # Determine client ip (Render/Cloudflare: x-forwarded-for typically present)
-    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    client_ip = xff or (request.client.host if request.client else "unknown")
-
-    now = _now()
-    window_start = now - (now % window_seconds)
-    key = f"stegtvc:rl:{bucket}:{client_ip}:{window_start}"
-
-    # INCR + EXPIRE is a standard pattern; small race on expire is acceptable.
-    count = await r.incr(key)
-    if count == 1:
-        await r.expire(key, window_seconds)
-
-    if count > limit:
-        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
-
-
-# ----------------------------
-# Admin auth dependency (X-Admin-Token)
-# ----------------------------
-async def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> None:
-    tok = _admin_token()
-    if not x_admin_token or x_admin_token.strip() != tok:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-# ----------------------------
-# Models
-# ----------------------------
+# ------------------------
+# Request/Response models
+# ------------------------
 class TokenIssueRequest(BaseModel):
     sub: str = Field(..., description="Subject identifier (user/workload).")
     action: str = Field(..., description="Machine-readable action name, e.g. 'deploy'.")
     scope: str = Field(..., description="Resource scope, e.g. 'repo:StegVerse-Labs/TVC'.")
-    ttl_seconds: int = Field(120, description="Token TTL seconds (clamped 10..300).")
+    ttl_seconds: int = Field(120, description="Token TTL seconds (clamped).")
     ctx_hash: Optional[str] = Field(None, description="Optional context hash binding.")
-    bundle_hash: Optional[str] = Field(None, description="Optional policy bundle hash/digest.")
+    bundle_hash: Optional[str] = Field(None, description="Optional policy bundle hash binding.")
     mode: str = Field("assisted", description="manual|assisted|autonomous|degraded|frozen")
-    extra: Optional[Dict[str, Any]] = Field(None, description="Optional extra claims dict (namespaced).")
+    extra: Optional[Dict[str, Any]] = Field(None, description="Optional extra claims dict.")
 
 
 class TokenIssueResponse(BaseModel):
@@ -205,89 +212,93 @@ class TokenVerifyResponse(BaseModel):
     valid: bool
     claims: Optional[Dict[str, Any]] = None
     reason: Optional[str] = None
+    refreshed_token: Optional[str] = None
+    refreshed_exp: Optional[int] = None
 
 
 class TokenRevokeResponse(BaseModel):
     rev: int
 
 
-# ----------------------------
-# FastAPI app (docs off in prod)
-# ----------------------------
-_docs_url = "/docs" if _is_dev() else None
-_redoc_url = "/redoc" if _is_dev() else None
-_openapi_url = "/openapi.json" if _is_dev() else None
-
+# ------------------------
+# App creation (docs toggle)
+# ------------------------
+docs_enabled = _docs_enabled()
 app = FastAPI(
     title="StegTVC Core",
-    description="StegVerse Token Vault Config / AI Provider Router (Core v0.1.x).",
+    description="StegVerse Token Vault Config / AI Provider Router (Core v1.0, option C).",
     version=get_settings().version,
-    docs_url=_docs_url,
-    redoc_url=_redoc_url,
-    openapi_url=_openapi_url,
+    docs_url="/docs" if docs_enabled else None,
+    redoc_url=None if _is_prod() else "/redoc",
+    openapi_url="/openapi.json" if docs_enabled else None,
 )
 
-# Add APIKey security scheme so Swagger “Authorize” sets X-Admin-Token
-if _is_dev():
-    from fastapi.openapi.utils import get_openapi
 
-    def custom_openapi():
-        if app.openapi_schema:
-            return app.openapi_schema
-        schema = get_openapi(
-            title=app.title,
-            version=app.version,
-            description=app.description,
-            routes=app.routes,
-        )
-        schema.setdefault("components", {}).setdefault("securitySchemes", {})["AdminToken"] = {
-            "type": "apiKey",
-            "in": "header",
-            "name": "X-Admin-Token",
-        }
-        # Apply globally to admin-tagged ops only (we’ll set per-route below)
-        app.openapi_schema = schema
-        return app.openapi_schema
-
-    app.openapi = custom_openapi  # type: ignore
+# ------------------------
+# Minimal hardening middleware
+# ------------------------
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    # If you later serve HTML: add CSP.
+    return resp
 
 
-# ----------------------------
-# Routes
-# ----------------------------
+# Root route so Render/health checks don't spam 404 on HEAD /
+@app.get("/", include_in_schema=False)
+async def root() -> JSONResponse:
+    return JSONResponse({"status": "ok"})
+
+
+# ------------------------
+# Health
+# ------------------------
 @app.get("/health", summary="Basic health check")
 async def health() -> JSONResponse:
-    settings = get_settings()
+    s = get_settings()
+    provider = get_default_provider(s.config)
+
+    # provider is a dict per your config.py
     payload: Dict[str, Any] = {
         "status": "ok",
-        "env": _env(),
-        "service": (os.getenv("APP_NAME") or settings.name or "stegtvc").lower(),
-        "version": settings.version,
+        "env": "prod" if _is_prod() else "dev",
+        "service": "stegtvc",
+        "version": s.version,
     }
 
-    # In dev only, show richer info (never leak this in prod)
-    if _is_dev():
-        try:
-            r = await _get_redis()
-            rev = await _get_rev_epoch(r)
-            payload["security"] = {
-                "docs_enabled": True,
-                "admin_header": "X-Admin-Token",
-                "token_ttl_max_seconds": 300,
-                "revocation_epoch": rev,
-                "jwt_signing": "HS256 (env: STEGTV_JWT_SECRET)",
-                "jwt_leeway_seconds": _jwt_leeway_seconds(),
-                "redis": "configured",
+    # In prod, keep health minimal (don’t leak endpoints/config).
+    if not _is_prod():
+        payload.update(
+            {
+                "public_url": os.getenv("PUBLIC_URL", "").strip() or "",
+                "default_provider": {
+                    "name": provider.get("name"),
+                    "model": provider.get("model"),
+                    "endpoint": provider.get("endpoint"),
+                },
+                "security": {
+                    "admin_header": "X-Admin-Token",
+                    "docs_enabled": docs_enabled,
+                    "token_ttl_max_seconds": int(os.getenv("STEGTV_TTL_MAX", "300")),
+                    "revocation_epoch": await _get_rev_epoch(),
+                    "jwt_signing": "HS256 (env: STEGTV_JWT_SECRET)",
+                    "sliding_enabled": _sliding_enabled(),
+                    "sliding_grace_seconds": _sliding_grace_seconds(),
+                },
+                "redis": {"configured": bool(_redis_url()), "active": bool(await _get_redis())},
             }
-        except Exception as e:
-            payload["security"] = {
-                "docs_enabled": True,
-                "redis": f"error: {e}",
-            }
+        )
 
     return JSONResponse(payload)
 
 
+# ------------------------
+# Provider routes
+# ------------------------
 @app.post(
     "/providers/resolve",
     response_model=ProviderResolveResponse,
@@ -303,52 +314,63 @@ async def providers_resolve(body: ProviderResolveRequest) -> ProviderResolveResp
     summary="Return the currently configured default provider/model.",
 )
 async def providers_default() -> ProviderInfo:
-    settings = get_settings()
-    base = settings.default_provider  # dict in your config.py
+    s = get_settings()
+    base = get_default_provider(s.config)
     return ProviderInfo(
-        name=base.get("name", ""),
-        model=base.get("model", ""),
-        endpoint=base.get("endpoint", ""),
+        name=str(base.get("name", "")),
+        model=str(base.get("model", "")),
+        endpoint=base.get("endpoint"),
         notes=base.get("notes"),
     )
 
 
-# ----------------------------
-# Admin-protected token endpoints
-# ----------------------------
+# ------------------------
+# Token logic
+# ------------------------
+def _encode_token(claims: Dict[str, Any]) -> str:
+    _require_jwt()
+    secret = _jwt_secret()
+    return jwt.encode(claims, secret, algorithm="HS256")
+
+
+def _decode_token(token: str, verify_exp: bool = True) -> Dict[str, Any]:
+    _require_jwt()
+    secret = _jwt_secret()
+    options = {"verify_exp": verify_exp}
+    return jwt.decode(
+        token,
+        secret,
+        algorithms=["HS256"],
+        options=options,
+        leeway=_jwt_leeway_seconds(),
+    )
+
+
 @app.post(
     "/tokens/issue",
     response_model=TokenIssueResponse,
     summary="Issue an ephemeral, action-scoped StegVerse token.",
-    tags=["admin"],
     dependencies=[Depends(require_admin)],
 )
-async def tokens_issue(request: Request, body: TokenIssueRequest) -> TokenIssueResponse:
-    _require_jwt()
-    secret = _jwt_secret()
-
-    r = await _get_redis()
-    await _rate_limit_or_429(request, r, bucket="tokens_issue", limit=30, window_seconds=60)
-
+async def tokens_issue(body: TokenIssueRequest) -> TokenIssueResponse:
     ttl = _clamp_ttl(body.ttl_seconds)
     iat = _now()
     exp = iat + ttl
     jti = str(uuid.uuid4())
-
-    rev_epoch = await _get_rev_epoch(r)
+    rev = await _get_rev_epoch()
 
     claims: Dict[str, Any] = {
         "iss": "stegverse:tvc",
         "sub": body.sub,
         "iat": iat,
+        "nbf": iat,
         "exp": exp,
         "jti": jti,
         "act": body.action,
         "scope": body.scope,
         "mode": body.mode,
-        "rev": rev_epoch,
+        "rev": rev,
     }
-
     if body.ctx_hash:
         claims["ctxh"] = body.ctx_hash
     if body.bundle_hash:
@@ -356,37 +378,47 @@ async def tokens_issue(request: Request, body: TokenIssueRequest) -> TokenIssueR
     if body.extra:
         claims["x"] = body.extra
 
-    token = jwt.encode(claims, secret, algorithm="HS256")
-    return TokenIssueResponse(token=token, exp=exp, jti=jti, rev=rev_epoch)
+    token = _encode_token(claims)
+    return TokenIssueResponse(token=token, exp=exp, jti=jti, rev=rev)
 
 
 @app.post(
     "/tokens/verify",
     response_model=TokenVerifyResponse,
     summary="Verify a StegVerse token and return claims.",
-    tags=["admin"],
     dependencies=[Depends(require_admin)],
 )
-async def tokens_verify(request: Request, body: TokenVerifyRequest) -> TokenVerifyResponse:
-    _require_jwt()
-    secret = _jwt_secret()
+async def tokens_verify(body: TokenVerifyRequest) -> TokenVerifyResponse:
+    now = _now()
+    grace = _sliding_grace_seconds()
+    sliding = _sliding_enabled()
 
-    r = await _get_redis()
-    await _rate_limit_or_429(request, r, bucket="tokens_verify", limit=120, window_seconds=60)
-
-    leeway = _jwt_leeway_seconds()
-
+    # First attempt: strict decode (checks exp)
     try:
-        claims = jwt.decode(body.token, secret, algorithms=["HS256"], leeway=leeway)
+        claims = _decode_token(body.token, verify_exp=True)
     except Exception as e:
-        return TokenVerifyResponse(valid=False, claims=None, reason=f"decode_failed: {e}")
+        # Sliding-window path: only if expired AND sliding enabled
+        msg = str(e)
+        if sliding and ("Signature has expired" in msg or "ExpiredSignatureError" in msg):
+            try:
+                # Decode without exp verification so we can evaluate grace window ourselves
+                claims = _decode_token(body.token, verify_exp=False)
+                exp = int(claims.get("exp", 0))
+                if exp <= 0:
+                    return TokenVerifyResponse(valid=False, claims=None, reason="decode_failed: missing exp")
 
-    try:
-        token_rev = int(claims.get("rev", -1))
-    except Exception:
-        token_rev = -1
+                if now > exp + grace:
+                    return TokenVerifyResponse(valid=False, claims=None, reason="expired_beyond_grace")
 
-    current_rev = await _get_rev_epoch(r)
+                # within grace, continue with normal checks below
+            except Exception as e2:
+                return TokenVerifyResponse(valid=False, claims=None, reason=f"decode_failed: {e2}")
+        else:
+            return TokenVerifyResponse(valid=False, claims=None, reason=f"decode_failed: {e}")
+
+    # Revocation epoch check
+    token_rev = int(claims.get("rev", -1))
+    current_rev = await _get_rev_epoch()
     if token_rev != current_rev:
         return TokenVerifyResponse(
             valid=False,
@@ -394,19 +426,45 @@ async def tokens_verify(request: Request, body: TokenVerifyRequest) -> TokenVeri
             reason=f"revoked: token_rev={token_rev} current_rev={current_rev}",
         )
 
-    return TokenVerifyResponse(valid=True, claims=claims, reason=None)
+    # Optionally refresh token if it's nearing expiry (sliding window usability)
+    exp = int(claims.get("exp", 0))
+    refreshed_token: Optional[str] = None
+    refreshed_exp: Optional[int] = None
+
+    if sliding and exp > 0:
+        under = _refresh_if_under_seconds()
+        if (exp - now) <= under:
+            # Mint a new token with same authority but a new exp/jti.
+            # This gives you a "sliding window" without accepting long-lived tokens.
+            ttl = _clamp_ttl(int(os.getenv("STEGTV_REFRESH_TTL", "120")))
+            iat = now
+            new_exp = now + ttl
+            new_jti = str(uuid.uuid4())
+
+            new_claims = dict(claims)
+            new_claims["iat"] = iat
+            new_claims["nbf"] = iat
+            new_claims["exp"] = new_exp
+            new_claims["jti"] = new_jti
+            # keep same rev
+            refreshed_token = _encode_token(new_claims)
+            refreshed_exp = new_exp
+
+    return TokenVerifyResponse(
+        valid=True,
+        claims=claims,
+        reason=None,
+        refreshed_token=refreshed_token,
+        refreshed_exp=refreshed_exp,
+    )
 
 
 @app.post(
     "/tokens/revoke",
     response_model=TokenRevokeResponse,
     summary="Revoke all previously issued tokens (bump epoch).",
-    tags=["admin"],
     dependencies=[Depends(require_admin)],
 )
-async def tokens_revoke(request: Request) -> TokenRevokeResponse:
-    r = await _get_redis()
-    await _rate_limit_or_429(request, r, bucket="tokens_revoke", limit=10, window_seconds=60)
-
-    new_rev = await _bump_rev_epoch(r)
+async def tokens_revoke() -> TokenRevokeResponse:
+    new_rev = await _bump_rev_epoch()
     return TokenRevokeResponse(rev=new_rev)
